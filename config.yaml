@@ -1,0 +1,20 @@
+llm:
+  gpt-4o:
+    model: gpt-4o
+    base_url: ${BASE_URL}
+    api_key: ${API_KEY}
+
+  deepseek-r1:
+    model: USD-guiji/deepseek-r1
+    base_url: ${BASE_URL}
+    api_key: ${API_KEY}
+
+  claude-thinking:
+    model: claude-opus-4-20250514-thinking
+    base_url: ${BASE_URL}
+    api_key: ${API_KEY}
+
+  claude:
+    model: claude-opus-4-20250514
+    base_url: ${BASE_URL}
+    api_key: ${API_KEY}

@@ -1,0 +1,15 @@
+rich
+openai
+pydantic
+yaml
+pyyaml
+httpx
+aiofiles
+browsergym
+gymnasium
+html2text
+numpy
+tenacity
+pillow
+uvicorn
+python-dotenv
