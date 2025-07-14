@@ -16,7 +16,8 @@ async def run_cmd(
         command,
         shell=True,  # 允许字符串形式命令
         capture_output=True,  # 捕获标准输出和错误
-        text=True  # 输出为字符串（不是字节）
+        text=True,  # 输出为字符串（不是字节）
+        cwd = "/workspace"
     )
 
     if verbose:
