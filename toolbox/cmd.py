@@ -9,8 +9,8 @@ async def run_cmd(
     执行一个完整的 shell 命令字符串，并返回执行结果。
 
     Args:
-        command (str): 要执行的命令，如 "ls -la /home"
-        verbose (bool): 是否打印输出（默认 True）
+        command: 要执行的命令，如 "ls -la /home"
+        verbose: 是否打印输出（默认 True）
     """
     result = subprocess.run(
         command,

@@ -15,6 +15,14 @@ from log import (
 
 AGENT_LOGGER = AgentLogger(level=LogLevel.INFO)
 
+# 专门用于browsergym，清理先前历史记录中的浏览器a11y树，减少上下文开销
+def replace_accessibility_tree_content(text):
+    pattern = re.compile(
+        r"============== BEGIN accessibility tree ==============(.*?)============== END accessibility tree ==============",
+        re.DOTALL | re.IGNORECASE
+    )
+    return pattern.sub(r"[Accessibility tree content removed for brevity]", text)
+
 
 def render_tool_json(tools: dict):
     tool_text = "\n".join([generate_tool_json(tools[tool_name]) for tool_name in tools])
@@ -90,9 +98,10 @@ class JarvisAgent:
                 yield chunk
                 ai_response += chunk
             self.history.extend([
-                {"role": "user", "content": [{"type": "text", "text": current_prompt}]},
+                {"role": "user", "content": [{"type": "text", "text": replace_accessibility_tree_content(current_prompt)}]},
                 {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
             ])
+            # print(self.history)
             parse_result = self.parse_tool_call(ai_response)
             # AGENT_LOGGER.log_markdown(parsing_message, "Tool call parsing result")
 
@@ -121,7 +130,8 @@ class JarvisAgent:
                 "并在反思后尝试重新进行工具调用，对于同一任务最多重新尝试五次"
 
             exist_tool_call = parse_result.exist_tool_call
-        print(f"总计执行步数：{steps}")
+
+        AGENT_LOGGER.log_task(f"总计执行步数：{steps}", subtitle="DONE", title="Task Over")
 
     async def call_tool(
             self,
@@ -156,7 +166,7 @@ class JarvisAgent:
                         chunk = tool_chunk["data"]["stream_chunk"]
                         yield "[STREAMING]", chunk  # 返回流式数据
 
-                        tool_result["data"]["final_result"] += chunk.content
+                        tool_result["data"]["final_result"] += chunk
                         tool_result["instruction"] = tool_chunk.get("instruction", "") # 将最后一个返回的工具指令作为最终工具指令
                 else:
                     # AGENT_LOGGER.log_markdown("Sync tool call", "Tool call type")

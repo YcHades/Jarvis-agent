@@ -1,7 +1,6 @@
 rich
 openai
 pydantic
-yaml
 pyyaml
 httpx
 aiofiles

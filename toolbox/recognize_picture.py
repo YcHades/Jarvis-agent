@@ -17,9 +17,7 @@ async def gpt4o_describe_image(
     使用 GPT-4o 对图像进行识别与理解。
 
     Args:
-        image_path (str): 本地图像路径
-        prompt (str): 对图像的任务描述，比如 OCR、场景描述、信息提取
-        model (str): 使用的 OpenAI 模型，默认 gpt-4o
+        image_path: 本地图像路径
     """
     image_bytes = Path(image_path).read_bytes()
     base64_image = base64.b64encode(image_bytes).decode("utf-8")

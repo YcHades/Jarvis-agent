@@ -14,7 +14,7 @@ RUN cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
 
 RUN rm /usr/lib/python3.12/EXTERNALLY-MANAGED \
     && pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
-    && pip install rich openai pydantic yaml pyyaml httpx aiofiles gymnasium html2text numpy tenacity pillow uvicorn \
+    && pip install rich openai pydantic pyyaml httpx aiofiles gymnasium html2text numpy tenacity pillow uvicorn \
     && pip install playwright browsergym-core
 RUN playwright install chromium
 RUN playwright install-deps chromium

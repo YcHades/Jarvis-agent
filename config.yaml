@@ -4,6 +4,11 @@ llm:
     base_url: ${BASE_URL}
     api_key: ${API_KEY}
 
+  deepseek-v3:
+    model: USD-guiji/deepseek-v3
+    base_url: ${BASE_URL}
+    api_key: ${API_KEY}
+
   deepseek-r1:
     model: USD-guiji/deepseek-r1
     base_url: ${BASE_URL}
