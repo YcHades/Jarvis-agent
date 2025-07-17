@@ -1,345 +1,222 @@
-
-import atexit
-import base64
-import io
+import asyncio
 import json
-import logging
-import multiprocessing
-import time
-import uuid
-import signal
-import threading
-from typing import Callable, Any
-from types import FrameType
-from uuid import UUID, uuid4
-from PIL import Image
+import sys
+from pathlib import Path
+from typing import Literal
 
-import browsergym.core  # noqa F401 (we register the openended task as a gym environment)
-import gymnasium as gym
-import html2text
-import numpy as np
-import tenacity
-from tenacity import RetryCallState
-from tenacity.stop import stop_base
-from browsergym.utils.obs import flatten_dom_to_str, overlay_som, flatten_axtree_to_str
-from uvicorn.server import HANDLED_SIGNALS
+from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use.config import get_default_profile, load_browser_use_config
+from browser_use.controller.service import Controller
+from browser_use.filesystem.file_system import FileSystem
 
+class BrowserUseLight:
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('jarvis_browser')
+    def __init__(self):
+        self.config = load_browser_use_config()
+        self.browser_session: BrowserSession | None = None
+        self.controller: Controller | None = None
+        self.file_system: FileSystem | None = None
 
-_should_exit = None
-_shutdown_listeners: dict[UUID, Callable] = {}
-
-
-def _register_signal_handler(sig: signal.Signals) -> None:
-    original_handler = None
-
-    def handler(sig_: int, frame: FrameType | None) -> None:
-        logger.debug(f'shutdown_signal:{sig_}')
-        global _should_exit
-        if not _should_exit:
-            _should_exit = True
-            listeners = list(_shutdown_listeners.values())
-            for callable in listeners:
-                try:
-                    callable()
-                except Exception:
-                    logger.exception('Error calling shutdown listener')
-            if original_handler:
-                original_handler(sig_, frame)  # type: ignore[unreachable]
-
-    original_handler = signal.signal(sig, handler)
-
-def _register_signal_handlers() -> None:
-    global _should_exit
-    if _should_exit is not None:
-        return
-    _should_exit = False
-
-    logger.debug('_register_signal_handlers')
-
-    # Check if we're in the main thread of the main interpreter
-    if threading.current_thread() is threading.main_thread():
-        logger.debug('_register_signal_handlers:main_thread')
-        for sig in HANDLED_SIGNALS:
-            _register_signal_handler(sig)
-    else:
-        logger.debug('_register_signal_handlers:not_main_thread')
-
-def should_exit() -> bool:
-    _register_signal_handlers()
-    return bool(_should_exit)
-
-
-def should_continue() -> bool:
-    _register_signal_handlers()
-    return not _should_exit
-
-class stop_if_should_exit(stop_base):
-    """Stop if the should_exit flag is set."""
-
-    def __call__(self, retry_state: 'RetryCallState') -> bool:
-        return bool(should_exit())
-
-class BrowserInitException(Exception):
-    def __init__(
-        self, message: str = 'Failed to initialize browser environment'
-    ) -> None:
-        super().__init__(message)
-
-def image_to_png_base64_url(
-    image: np.ndarray | Image.Image, add_data_prefix: bool = False
-) -> str:
-    """Convert a numpy array to a base64 encoded png image url."""
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(image)
-    if image.mode in ('RGBA', 'LA'):
-        image = image.convert('RGB')
-    buffered = io.BytesIO()
-    image.save(buffered, format='PNG')
-
-    image_base64 = base64.b64encode(buffered.getvalue()).decode()
-    return (
-        f'data:image/png;base64,{image_base64}'
-        if add_data_prefix
-        else f'{image_base64}'
-    )
-
-
-BROWSER_EVAL_GET_GOAL_ACTION = 'GET_EVAL_GOAL'
-BROWSER_EVAL_GET_REWARDS_ACTION = 'GET_EVAL_REWARDS'
-
-
-class BrowserEnv:
-    def __init__(self, browsergym_eval_env: str | None = None):
-        self.html_text_converter = self.get_html_text_converter()
-        # self.eval_mode = False
-        # self.eval_dir = ''
-
-        # EVAL only: browsergym_eval_env must be provided for evaluation
-        # self.browsergym_eval_env = browsergym_eval_env
-        # self.eval_mode = bool(browsergym_eval_env)
-
-        # Initialize browser environment process
-        multiprocessing.set_start_method('spawn', force=True)
-        self.browser_side, self.agent_side = multiprocessing.Pipe()
-
-        self.init_browser()
-        atexit.register(self.close)
-
-    def get_html_text_converter(self) -> html2text.HTML2Text:
-        html_text_converter = html2text.HTML2Text()
-        # ignore links and images
-        html_text_converter.ignore_links = False
-        html_text_converter.ignore_images = True
-        # use alt text for images
-        html_text_converter.images_to_alt = True
-        # disable auto text wrapping
-        html_text_converter.body_width = 0
-        return html_text_converter
-
-    @tenacity.retry(
-        wait=tenacity.wait_fixed(1),
-        stop=tenacity.stop_after_attempt(5) | stop_if_should_exit(),
-        retry=tenacity.retry_if_exception_type(BrowserInitException),
-    )
-    def init_browser(self) -> None:
-        logger.debug('Starting browser env...')
-        try:
-            self.process = multiprocessing.Process(target=self.browser_process)
-            self.process.start()
-        except Exception as e:
-            logger.error(f'Failed to start browser process: {e}')
-            raise
-
-        if not self.check_alive(timeout=200):
-            self.close()
-            raise BrowserInitException('Failed to start browser environment.')
-
-    def browser_process(self) -> None:
-        env = gym.make(
-            'browsergym/openended',
-            task_kwargs={'start_url': 'about:blank', 'goal': 'PLACEHOLDER_GOAL'},
-            wait_for_user_message=False,
-            headless=True,
-            disable_env_checker=True,
-            tags_to_mark='all',
-            timeout=100000,
-            pw_context_kwargs={'accept_downloads': True},
-            pw_chromium_kwargs={'downloads_path': '/workspace/.downloads/'},
-        )
-
-        obs, info = env.reset()
-
-        logger.info('Successfully called env.reset')
-        logger.info('Browser env started.')
-
-        while should_continue():
-            try:
-                if self.browser_side.poll(timeout=0.01):
-                    unique_request_id, action_data = self.browser_side.recv()
-
-                    # shutdown the browser environment
-                    if unique_request_id == 'SHUTDOWN':
-                        logger.debug('SHUTDOWN recv, shutting down browser env...')
-                        env.close()
-                        return
-                    elif unique_request_id == 'IS_ALIVE':
-                        self.browser_side.send(('ALIVE', None))
-                        continue
-
-                    action = action_data['action']
-                    obs, reward, terminated, truncated, info = env.step(action)
-
-                    # add text content of the page
-                    html_str = flatten_dom_to_str(obs['dom_object'])
-                    obs['text_content'] = self.html_text_converter.handle(html_str)
-                    # make observation serializable
-                    obs['set_of_marks'] = image_to_png_base64_url(
-                        overlay_som(
-                            obs['screenshot'], obs.get('extra_element_properties', {})
-                        ),
-                        add_data_prefix=True,
-                    )
-                    obs['screenshot'] = image_to_png_base64_url(
-                        obs['screenshot'], add_data_prefix=True
-                    )
-                    obs['active_page_index'] = obs['active_page_index'].item()
-                    obs['elapsed_time'] = obs['elapsed_time'].item()
-                    self.browser_side.send((unique_request_id, obs))
-            except KeyboardInterrupt:
-                logger.debug('Browser env process interrupted by user.')
-                try:
-                    env.close()
-                except Exception:
-                    pass
-                return
-
-    def step(self, action_str: str, timeout: float = 120) -> dict:
-        """Execute an action in the browser environment and return the observation."""
-        unique_request_id = str(uuid.uuid4())
-        self.agent_side.send((unique_request_id, {'action': action_str}))
-        start_time = time.time()
-        while True:
-            if should_exit() or time.time() - start_time > timeout:
-                raise TimeoutError('Browser environment took too long to respond.')
-            if self.agent_side.poll(timeout=0.01):
-                response_id, obs = self.agent_side.recv()
-                if response_id == unique_request_id:
-                    return dict(obs)
-
-    def check_alive(self, timeout: float = 60) -> bool:
-        self.agent_side.send(('IS_ALIVE', None))
-        if self.agent_side.poll(timeout=timeout):
-            response_id, _ = self.agent_side.recv()
-            if response_id == 'ALIVE':
-                return True
-            logger.debug(f'Browser env is not alive. Response ID: {response_id}')
-        return False
-
-    def close(self) -> None:
-        if not self.process.is_alive():
+    async def _init_browser_session(self, **kwargs):
+        """Initialize browser session using config"""
+        if self.browser_session:
             return
-        try:
-            self.agent_side.send(('SHUTDOWN', None))
-            self.process.join(5)  # Wait for the process to terminate
-            if self.process.is_alive():
-                logger.error(
-                    'Browser process did not terminate, forcefully terminating...'
-                )
-                self.process.terminate()
-                self.process.join(5)  # Wait for the process to terminate
-                if self.process.is_alive():
-                    self.process.kill()
-                    self.process.join(5)  # Wait for the process to terminate
-            self.agent_side.close()
-            self.browser_side.close()
-        except Exception as e:
-            logger.error(f'Encountered an error when closing browser env: {e}')
 
+        # Get profile config
+        # profile_config = get_default_profile(self.config)
 
-def get_axtree_str(
-    axtree_object: dict[str, Any],
-    extra_element_properties: dict[str, Any],
-    filter_visible_only: bool = False,
-) -> str:
-    cur_axtree_txt = flatten_axtree_to_str(
-        axtree_object,
-        extra_properties=extra_element_properties,
-        with_clickable=True,
-        skip_generic=False,
-        filter_visible_only=filter_visible_only,
-    )
-    return str(cur_axtree_txt)
+        # Merge profile config with defaults and overrides
+        profile_data = {
+            'downloads_path': str(Path.home() / 'downloads'),
+            'wait_between_actions': 0.5,
+            'keep_alive': True,
+            'user_data_dir': '~/.config/browseruse/profiles/default',
+            'is_mobile': False,
+            'device_scale_factor': 1.0,
+            'disable_security': False,
+            'headless': True,
+            "id": "79bfe7fd-1a9b-4c69-a7aa-0266ff82e49b",
+            "default": True,
+            "created_at": "2025-07-16T10:12:15.367877",
+            "allowed_domains": None,
+            # **profile_config,  # Config values override defaults
+        }
 
-def get_agent_obs_text(obs: dict) -> str:
-    text = f'[Current URL: {obs["url"]}]\n'
-    text += f'[Focused element bid: {obs["focused_element_bid"]}]\n'
+        # Merge any additional kwargs that are valid BrowserProfile fields
+        for key, value in kwargs.items():
+            profile_data[key] = value
 
-    text += '\n'
+        # Create browser profile
+        profile = BrowserProfile(**profile_data)
 
-    if obs["error"]:
-        text += (
-            '================ BEGIN error message ===============\n'
-            'The following error occurred when executing the last action:\n'
-            f'{obs["last_browser_action_error"]}\n'
-            '================ END error message ===============\n'
-        )
-    else:
-        text += '[Action executed successfully.]\n'
-    try:
-        cur_axtree_txt = get_axtree_str(
-            obs["axtree_object"],
-            obs["extra_element_properties"]
-        )
-        text += (
-            f'Accessibility tree of the COMPLETE webpage:\nNote: [bid] is the unique alpha-numeric identifier at the beginning of lines for each element in the AXTree. Always use bid to refer to elements in your actions.\n'
-            f'============== BEGIN accessibility tree ==============\n'
-            f'{cur_axtree_txt}\n'
-            f'============== END accessibility tree ==============\n'
-        )
-    except Exception as e:
-        text += f'\n[Error encountered when processing the accessibility tree: {e}]'
-    return text
+        # Create browser session
+        self.browser_session = BrowserSession(browser_profile=profile)
+        await self.browser_session.start()
 
-def refine_obs(obs: dict) -> dict:
-    return {
-        "content": obs['text_content'],
-        "last_browser_action_error": obs.get('last_action_error', ''),
-        "error": True if obs.get('last_action_error', '') else False,
-        "focused_element_bid": obs.get('focused_element_bid', None),
-        "axtree_object": obs.get('axtree_object', {}),
-        "extra_element_properties": obs.get('extra_element_properties', {}),
-        "url": obs.get('url', '')
-    }
+        # Create controller for direct actions
+        self.controller = Controller()
 
-if __name__ == '__main__':
-    browser = BrowserEnv()
+        # Initialize FileSystem for extraction actions
+        file_system_path = profile_data.get('file_system_path', '~/.browser-use-mcp')
+        self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
-    obs = refine_obs(
-        browser.step("noop(10000)")
-    )
-    obs["content"] = get_agent_obs_text(obs)
+    async def _navigate(self, url: str, new_tab: bool = False) -> str:
+        """Navigate to a URL."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
 
-    print(obs["content"])
+        if new_tab:
+            page = await self.browser_session.navigate(url, new_tab=True)
+            tab_idx = self.browser_session.tabs.index(page)
+            return f'Opened new tab #{tab_idx} with URL: {url}'
+        else:
+            await self.browser_session.navigate(url)
+            return f'Navigated to: {url}'
 
-    # with open("misc/test1.txt", "w", encoding="utf-8") as f:
-    #     f.write(obs["content"])
+    async def _click(self, index: int, new_tab: bool = False) -> str:
+        """Click an element by index."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
 
-    obs = refine_obs(
-        browser.step("click('34')")
-    )
-    obs["content"] = get_agent_obs_text(obs)
+        # Get the element
+        element = await self.browser_session.get_dom_element_by_index(index)
+        if not element:
+            return f'Element with index {index} not found'
 
-    print(obs["content"])
-    # with open("misc/test2.txt", "w", encoding="utf-8") as f:
-    #     f.write(obs["content"])
+        if new_tab:
+            # For links, extract href and open in new tab
+            href = element.attributes.get('href')
+            if href:
+                # Convert relative href to absolute URL
+                current_page = await self.browser_session.get_current_page()
+                if href.startswith('/'):
+                    # Relative URL - construct full URL
+                    from urllib.parse import urlparse
 
-    # obs = refine_obs(
-    #     browser.step("fill('34', 'ychades150@gmail.com')")
-    # )
-    # obs["content"] = get_agent_obs_text(obs)
-    # with open("misc/test3.txt", "w", encoding="utf-8") as f:
-    #     f.write(obs["content"])
+                    parsed = urlparse(current_page.url)
+                    full_url = f'{parsed.scheme}://{parsed.netloc}{href}'
+                else:
+                    full_url = href
+
+                # Open link in new tab
+                page = await self.browser_session.navigate(full_url, new_tab=True)
+                tab_idx = self.browser_session.tabs.index(page)
+                return f'Clicked element {index} and opened in new tab #{tab_idx}'
+            else:
+                # For non-link elements, try Cmd/Ctrl+Click
+                page = await self.browser_session.get_current_page()
+                element_handle = await self.browser_session.get_locate_element(element)
+                if element_handle:
+                    # Use playwright's click with modifiers
+                    modifier: Literal['Meta', 'Control'] = 'Meta' if sys.platform == 'darwin' else 'Control'
+                    await element_handle.click(modifiers=[modifier])
+                    # Wait a bit for potential new tab
+                    await asyncio.sleep(0.5)
+                    return f'Clicked element {index} with {modifier} key (new tab if supported)'
+                else:
+                    return f'Could not locate element {index} for modified click'
+        else:
+            # Normal click
+            await self.browser_session._click_element_node(element)
+            return f'Clicked element {index}'
+
+    async def _get_browser_state(self, include_screenshot: bool = False) -> str:
+        """Get current browser state."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        state = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
+
+        result = {
+            'url': state.url,
+            'title': state.title,
+            'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+            'interactive_elements': [],
+        }
+
+        # Add interactive elements with their indices
+        for index, element in state.selector_map.items():
+            elem_info = {
+                'index': index,
+                'tag': element.tag_name,
+                'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+            }
+            if element.attributes.get('placeholder'):
+                elem_info['placeholder'] = element.attributes['placeholder']
+            if element.attributes.get('href'):
+                elem_info['href'] = element.attributes['href']
+            result['interactive_elements'].append(elem_info)
+
+        if include_screenshot and state.screenshot:
+            result['screenshot'] = state.screenshot
+
+        return "============== BROWSER STATE BEGIN ==============\n" + json.dumps(result, indent=2, ensure_ascii=False) + "\n============== BROWSER STATE END =============="
+
+    async def _type_text(self, index: int, text: str) -> str:
+        """Type text into an element."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        element = await self.browser_session.get_dom_element_by_index(index)
+        if not element:
+            return f'Element with index {index} not found'
+
+        await self.browser_session._input_text_element_node(element, text)
+        return f"Typed '{text}' into element {index}"
+
+    async def _send_keys(self, keys: str) -> str:
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        page = await self.browser_session.get_current_page()
+        await page.keyboard.press(keys)
+        return f"Sent keys: {keys}"
+
+    async def _go_back(self) -> str:
+        """Go back in browser history."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        await self.browser_session.go_back()
+        return 'Navigated back'
+
+    async def _close_browser(self) -> str:
+        """Close the browser session."""
+        if self.browser_session:
+            await self.browser_session.stop()
+            self.browser_session = None
+            self.controller = None
+            return 'Browser closed'
+        return 'No browser session to close'
+
+    async def _list_tabs(self) -> str:
+        """List all open tabs."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        tabs = []
+        for i, tab in enumerate(self.browser_session.tabs):
+            tabs.append({'index': i, 'url': tab.url, 'title': await tab.title() if not tab.is_closed() else 'Closed'})
+        return json.dumps(tabs, indent=2)
+
+    async def _switch_tab(self, tab_index: int) -> str:
+        """Switch to a different tab."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        await self.browser_session.switch_to_tab(tab_index)
+        page = await self.browser_session.get_current_page()
+        return f'Switched to tab {tab_index}: {page.url}'
+
+    async def _close_tab(self, tab_index: int) -> str:
+        """Close a specific tab."""
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        if 0 <= tab_index < len(self.browser_session.tabs):
+            tab = self.browser_session.tabs[tab_index]
+            url = tab.url
+            await tab.close()
+            return f'Closed tab {tab_index}: {url}'
+        return f'Invalid tab index: {tab_index}'
 

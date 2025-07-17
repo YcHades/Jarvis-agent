@@ -15,13 +15,13 @@ from log import (
 
 AGENT_LOGGER = AgentLogger(level=LogLevel.INFO)
 
-# 专门用于browsergym，清理先前历史记录中的浏览器a11y树，减少上下文开销
-def replace_accessibility_tree_content(text):
+
+def remove_browser_state(text):
     pattern = re.compile(
-        r"============== BEGIN accessibility tree ==============(.*?)============== END accessibility tree ==============",
+        r"============== BROWSER STATE BEGIN ==============(.*?)============== BROWSER STATE END ==============",
         re.DOTALL | re.IGNORECASE
     )
-    return pattern.sub(r"[Accessibility tree content removed for brevity]", text)
+    return pattern.sub(r"[history browser state removed for brevity]", text)
 
 
 def render_tool_json(tools: dict):
@@ -60,21 +60,27 @@ class JarvisAgent:
             tools=self.tools
         )}]})
 
+    def save_trajectory(self, output_path="trajectory.json"):
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self.history, ensure_ascii=False, indent=4))
+
     async def chat(self,
         prompt: str,
         llm_name: str = None,
+        step_limit: int = None
     ):
         if llm_name is not None:
             self.llm = LLM(llm_name)
 
-        async for chunk in self.reason_and_act(prompt):
+        async for chunk in self.reason_and_act(prompt, step_limit):
             print(chunk, end="", flush=True)
         print("\n================================================")
         # print(self.history)
 
     async def reason_and_act(
         self,
-        prompt: str
+        prompt: str,
+        step_limit: int = None
     ) -> AsyncGenerator[str, None]:
         """
         判断LLM输出中是否包含工具执行要求，如果存在则会执行工具
@@ -83,7 +89,7 @@ class JarvisAgent:
         current_prompt = prompt
         exist_tool_call = True
         steps = 0
-        while exist_tool_call:
+        while exist_tool_call and (step_limit is None or steps < step_limit):
             steps += 1
             # 需要修改system_prompt中的当前时间
             self.history[0] = {"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
@@ -98,7 +104,7 @@ class JarvisAgent:
                 yield chunk
                 ai_response += chunk
             self.history.extend([
-                {"role": "user", "content": [{"type": "text", "text": replace_accessibility_tree_content(current_prompt)}]},
+                {"role": "user", "content": [{"type": "text", "text": remove_browser_state(current_prompt)}]},
                 {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
             ])
             # print(self.history)

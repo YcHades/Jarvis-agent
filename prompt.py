@@ -31,11 +31,11 @@ email: theagentcompany
 password: theagentcompany
 </account>
 
-以下是根据用户输入检索得到的信息：
+以下是你先前学习到的一些经验：
 <knowledge>
 {{knowledge}}
 </knowledge>
-上述信息用于给你执行任务时参考
+上述经验用于为你成功执行任务提供参考
 
 
 ### TOOLS ###
