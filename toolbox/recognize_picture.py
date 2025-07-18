@@ -1,13 +1,12 @@
+
+import os
 import base64
 from pathlib import Path
 from openai import OpenAI
 
-api_key = "sk-mpgDJJe9yhJ3dynDUSM8HsVMiWcSScXArvp635WPwi5aJ6CL"
-base_url = "http://35.220.164.252:3888/v1"
-
 client = OpenAI(
-    api_key=api_key,
-    base_url=base_url
+    api_key=os.getenv("API_KEY"),
+    base_url=os.getenv("BASE_URL")
 )
 
 async def gpt4o_describe_image(
