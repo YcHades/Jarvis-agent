@@ -16,15 +16,15 @@ from log import (
 AGENT_LOGGER = AgentLogger(level=LogLevel.INFO)
 
 
-def remove_browser_state(text):
+def remove_browser_info_in_the_history(text: str) -> str:
     pattern = re.compile(
-        r"============== BROWSER STATE BEGIN ==============(.*?)============== BROWSER STATE END ==============",
+        r"============== BROWSER INFO BEGIN ==============(.*?)============== BROWSER INFO END ==============",
         re.DOTALL | re.IGNORECASE
     )
-    return pattern.sub(r"[history browser state removed for brevity]", text)
+    return pattern.sub(r"[history browser info removed for brevity]", text)
 
 
-def render_tool_json(tools: dict):
+def render_tool_json(tools: dict) -> str:
     tool_text = "\n".join([generate_tool_json(tools[tool_name]) for tool_name in tools])
     AGENT_LOGGER.log_task(tool_text, subtitle="LOADING······", title="Loading Tools")
     return tool_text
@@ -47,6 +47,8 @@ class JarvisAgent:
 
         self.llm = LLM(init_model_name)
         self.sys_prompt_template = sys_prompt_template
+        with open("memory/system_memory.txt", mode="r", encoding="utf-8") as f:
+            self.system_memory = f.read()
 
         # 工具加载
         self.tool_registrar = ToolRegistry()
@@ -56,7 +58,7 @@ class JarvisAgent:
         # system prompt永远在历史记录的最前面
         self.history.append({"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
             now=datetime.now(),
-            knowledge="",
+            knowledge=self.system_memory,
             tools=self.tools
         )}]})
 
@@ -66,16 +68,28 @@ class JarvisAgent:
 
     async def chat(self,
         prompt: str,
+        memory_path: str = "memory/system_memory.txt",
         llm_name: str = None,
         step_limit: int = None
-    ):
+    ) -> str:
         if llm_name is not None:
             self.llm = LLM(llm_name)
 
+        # 每次新一轮的任务执行都需要重新加载最新的以及内容
+        # TODO: 整体记忆载入的逻辑可以优化一下
+        with open(memory_path, mode="r", encoding="utf-8") as f:
+            self.system_memory = f.read()
+
+        AGENT_LOGGER.log_task(self.system_memory, subtitle="LOADING······", title="Loading Memory")
+
+        last_ai_response = ""
         async for chunk in self.reason_and_act(prompt, step_limit):
+            last_ai_response += chunk
             print(chunk, end="", flush=True)
         print("\n================================================")
         # print(self.history)
+
+        return last_ai_response
 
     async def reason_and_act(
         self,
@@ -94,7 +108,7 @@ class JarvisAgent:
             # 需要修改system_prompt中的当前时间
             self.history[0] = {"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
                 now=datetime.now(),
-                knowledge="",
+                knowledge=self.system_memory,
                 tools=self.tools
             )}]}
 
@@ -103,8 +117,13 @@ class JarvisAgent:
             async for chunk in generator:
                 yield chunk
                 ai_response += chunk
+            # 保留最近6轮对话中的浏览器状态，减少上下文
+            if len(self.history) > 6:
+                history_user_content = self.history[-2]["content"][0]["text"]
+                self.history[-6] = {"role": "user", "content": [
+                    {"type": "text", "text": remove_browser_info_in_the_history(history_user_content)}]}
             self.history.extend([
-                {"role": "user", "content": [{"type": "text", "text": remove_browser_state(current_prompt)}]},
+                {"role": "user", "content": [{"type": "text", "text": current_prompt}]},
                 {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
             ])
             # print(self.history)

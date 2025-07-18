@@ -1,13 +1,18 @@
 import asyncio
 import json
+import os
+import re
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Any
 
 from browser_use.browser import BrowserProfile, BrowserSession
-from browser_use.config import get_default_profile, load_browser_use_config
+from browser_use.config import get_default_profile, load_browser_use_config, get_default_llm, FlatEnvConfig
+from browser_use.controller.registry.views import ActionModel
 from browser_use.controller.service import Controller
 from browser_use.filesystem.file_system import FileSystem
+from browser_use.llm.openai.chat import ChatOpenAI
+
 
 class BrowserUseLight:
 
@@ -16,7 +21,9 @@ class BrowserUseLight:
         self.browser_session: BrowserSession | None = None
         self.controller: Controller | None = None
         self.file_system: FileSystem | None = None
+        self.llm: ChatOpenAI | None = None
 
+    # TODO: 需要暴露更多的路径参数给初始化
     async def _init_browser_session(self, **kwargs):
         """Initialize browser session using config"""
         if self.browser_session:
@@ -27,14 +34,14 @@ class BrowserUseLight:
 
         # Merge profile config with defaults and overrides
         profile_data = {
-            'downloads_path': str(Path.home() / 'downloads'),
+            'downloads_path': '/workspace/downloads',
             'wait_between_actions': 0.5,
             'keep_alive': True,
             'user_data_dir': '~/.config/browseruse/profiles/default',
             'is_mobile': False,
             'device_scale_factor': 1.0,
             'disable_security': False,
-            'headless': True,
+            # 'headless': True,
             "id": "79bfe7fd-1a9b-4c69-a7aa-0266ff82e49b",
             "default": True,
             "created_at": "2025-07-16T10:12:15.367877",
@@ -56,8 +63,18 @@ class BrowserUseLight:
         # Create controller for direct actions
         self.controller = Controller()
 
+        llm_config = get_default_llm(self.config)
+        if api_key := llm_config.get('api_key'):
+            self.llm = ChatOpenAI(
+                model=llm_config.get('model', 'gpt-4o-mini'),
+                api_key=api_key,
+                base_url=os.getenv('BASE_URL'),
+                temperature=llm_config.get('temperature', 0.7),
+                # max_tokens=llm_config.get('max_tokens'),
+            )
+
         # Initialize FileSystem for extraction actions
-        file_system_path = profile_data.get('file_system_path', '~/.browser-use-mcp')
+        file_system_path = profile_data.get('file_system_path', '/workspace/browser-use')
         self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
     async def _navigate(self, url: str, new_tab: bool = False) -> str:
@@ -120,7 +137,7 @@ class BrowserUseLight:
             await self.browser_session._click_element_node(element)
             return f'Clicked element {index}'
 
-    async def _get_browser_state(self, include_screenshot: bool = False) -> str:
+    async def _get_browser_state(self) -> str:
         """Get current browser state."""
         if not self.browser_session:
             return 'Error: No browser session active'
@@ -136,10 +153,21 @@ class BrowserUseLight:
 
         # Add interactive elements with their indices
         for index, element in state.selector_map.items():
+            raw_str = element.clickable_elements_to_string().replace('\t', '').replace('\n[', '[')
+            # 匹配所有的 "[数字]"，返回所有索引
+            all_indices = [int(x) for x in re.findall(r'\[(\d+)\]', raw_str)]
+            # main_idx = all_indices[0] if all_indices else None
+            sub_element_indices = all_indices[1:] if len(all_indices) > 1 else []
+
+            # 提取第一个 <xxx ... /> 作为主元素标签内容
+            main_tag_match = re.search(r'\[\d+\]<(.*?)\/>', raw_str)
+            main_tag_text = '<' + main_tag_match.group(1).strip() + '/>' if main_tag_match else ""
+
             elem_info = {
                 'index': index,
                 'tag': element.tag_name,
-                'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+                'text': main_tag_text,
+                # 'sub_element_index': sub_element_indices,
             }
             if element.attributes.get('placeholder'):
                 elem_info['placeholder'] = element.attributes['placeholder']
@@ -147,10 +175,62 @@ class BrowserUseLight:
                 elem_info['href'] = element.attributes['href']
             result['interactive_elements'].append(elem_info)
 
-        if include_screenshot and state.screenshot:
-            result['screenshot'] = state.screenshot
+        return "============== BROWSER INFO BEGIN ==============\n" + json.dumps(result) + "\n============== BROWSER INFO END =============="
 
-        return "============== BROWSER STATE BEGIN ==============\n" + json.dumps(result, indent=2, ensure_ascii=False) + "\n============== BROWSER STATE END =============="
+    async def _extract_content_by_vision(self, query: str) -> str:
+
+        state = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
+
+        response = await self.llm.get_client().chat.completions.create(
+            model=self.llm.model,
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": query},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{state.screenshot}"}
+                    }
+                ]}
+            ]
+        )
+
+        return response.choices[0].message.content
+
+    async def _extract_content(self, query: str, extract_links: bool = False) -> str:
+        """Extract content from current page."""
+        if not self.llm:
+            return 'Error: LLM not initialized (set OPENAI_API_KEY)'
+
+        if not self.file_system:
+            return 'Error: FileSystem not initialized'
+
+        if not self.browser_session:
+            return 'Error: No browser session active'
+
+        if not self.controller:
+            return 'Error: Controller not initialized'
+
+        page = await self.browser_session.get_current_page()
+
+        # Use the extract_structured_data action
+        # Create a dynamic action model that matches the controller's expectations
+        from pydantic import create_model
+
+        # Create action model dynamically
+        ExtractAction = create_model(
+            'ExtractAction',
+            __base__=ActionModel,
+            extract_structured_data=(dict[str, Any], ...)
+        )
+        action = ExtractAction(extract_structured_data={'query': query, 'extract_links': extract_links})
+        action_result = await self.controller.act(
+            action=action,
+            browser_session=self.browser_session,
+            page_extraction_llm=self.llm,
+            file_system=self.file_system,
+        )
+
+        return "============== BROWSER INFO BEGIN ==============\n" + json.dumps(action_result.extracted_content or 'No content extracted', indent=2) + "\n============== BROWSER INFO END =============="
 
     async def _type_text(self, index: int, text: str) -> str:
         """Type text into an element."""
