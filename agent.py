@@ -1,33 +1,22 @@
 import re
 import json
 import inspect
+import traceback
+from abc import abstractmethod
 from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
+
 from pydantic import BaseModel, Field
-from typing import AsyncGenerator, Union, Dict
+from typing import AsyncGenerator, Union, Dict, Any, Tuple, List
 
 from model import LLM
-from tool import generate_tool_json, ToolRegistry
-from log import (
-    AgentLogger,
-    LogLevel,
-)
-
-AGENT_LOGGER = AgentLogger(level=LogLevel.INFO)
-
-
-def remove_browser_info_in_the_history(text: str) -> str:
-    pattern = re.compile(
-        r"============== BROWSER INFO BEGIN ==============(.*?)============== BROWSER INFO END ==============",
-        re.DOTALL | re.IGNORECASE
-    )
-    return pattern.sub(r"[history browser info removed for brevity]", text)
-
-
-def render_tool_json(tools: dict) -> str:
-    tool_text = "\n".join([generate_tool_json(tools[tool_name]) for tool_name in tools])
-    AGENT_LOGGER.log_task(tool_text, subtitle="LOADING······", title="Loading Tools")
-    return tool_text
+from prompt.reflect_memory import react_block_reflect_prompt
+from prompt.system_prompt import jarvis_list_fact_prompt, jarvis_confirm_fact_prompt, \
+    jarvis_plan_multi_steps_task_prompt, jarvis_execute_task_step_prompt, jarvis_act_prompt
+from tool import generate_tool_schema, ToolRegistry
+from log import AgentLogger, LogLevel
+from utils import extract_json_codeblock, remove_browser_info_in_the_history
 
 @dataclass
 class ToolCallParseResult:
@@ -35,134 +24,67 @@ class ToolCallParseResult:
     tool_json: Union[Dict[str, str], None]
     parse_msg: str
 
-class JarvisAgent:
-    """
-    jarvis后端agent代理
-    """
-    def __init__(self,
-        init_model_name: str,
-        sys_prompt_template: str,
+class BaseAgent:
+    def __init__(
+            self,
+            init_model_name: str,
+            sys_prompt_template: str
     ):
-        self.history = []
-
+        self.logger = AgentLogger(level=LogLevel.INFO)
         self.llm = LLM(init_model_name)
-        self.sys_prompt_template = sys_prompt_template
-        with open("memory/system_memory.txt", mode="r", encoding="utf-8") as f:
-            self.system_memory = f.read()
 
-        # 工具加载
         self.tool_registrar = ToolRegistry()
         self.tool_registrar.load_tools(tools_folder="toolbox")
-        self.tools = render_tool_json(self.tool_registrar.tools)
 
-        # system prompt永远在历史记录的最前面
-        self.history.append({"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
-            now=datetime.now(),
-            knowledge=self.system_memory,
-            tools=self.tools
-        )}]})
+        self.history = []
+        self.sys_prompt_template = sys_prompt_template
 
-    def save_trajectory(self, output_path="trajectory.json"):
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self.history, ensure_ascii=False, indent=4))
+    def render_tool_schema_texts(self) -> str:
+        tool_schemas = []
+        for tool_name, tool_func in self.tool_registrar.tools.items():
+            tool_schemas.append(generate_tool_schema(tool_func))
 
-    async def chat(self,
-        prompt: str,
-        memory_path: str = "memory/system_memory.txt",
-        llm_name: str = None,
-        step_limit: int = None
-    ) -> str:
-        if llm_name is not None:
-            self.llm = LLM(llm_name)
+        tools_schema_texts = "\n".join(tool_schemas)
+        return tools_schema_texts
 
-        # 每次新一轮的任务执行都需要重新加载最新的以及内容
-        # TODO: 整体记忆载入的逻辑可以优化一下
-        with open(memory_path, mode="r", encoding="utf-8") as f:
-            self.system_memory = f.read()
+    def save_trajectory(self, output_path="outputs/trajectory.json"):
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        AGENT_LOGGER.log_task(self.system_memory, subtitle="LOADING······", title="Loading Memory")
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self.history, f, ensure_ascii=False, indent=4)
 
-        last_ai_response = ""
-        async for chunk in self.reason_and_act(prompt, step_limit):
-            last_ai_response += chunk
-            print(chunk, end="", flush=True)
-        print("\n================================================")
-        # print(self.history)
+    def pretty_print_trajectory(self, messages: List[dict], show_full_content: bool=False):
+        print()
+        def colored(text, color):
+            COLORS = {
+                "user": "\033[96m",  # 青色
+                "assistant": "\033[92m",  # 绿色
+                "system": "\033[95m",  # 紫色
+                "end": "\033[0m",
+            }
+            return COLORS.get(color, "") + text + COLORS["end"]
 
-        return last_ai_response
+        for idx, msg in enumerate(messages):
+            role = msg.get("role", "")
+            if role not in ("system", "user", "assistant"):
+                continue
+            role_disp = colored(f"[{role.upper()}]", role)
+            print(f"{idx + 1:02d}. {role_disp}")
 
-    async def reason_and_act(
-        self,
-        prompt: str,
-        step_limit: int = None
-    ) -> AsyncGenerator[str, None]:
-        """
-        判断LLM输出中是否包含工具执行要求，如果存在则会执行工具
-        这一过程会反复进行，直到LLM输出中不再包含工具执行要求
-        """
-        current_prompt = prompt
-        exist_tool_call = True
-        steps = 0
-        while exist_tool_call and (step_limit is None or steps < step_limit):
-            steps += 1
-            # 需要修改system_prompt中的当前时间
-            self.history[0] = {"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
-                now=datetime.now(),
-                knowledge=self.system_memory,
-                tools=self.tools
-            )}]}
-
-            generator = self.llm.async_stream_generate(current_prompt, history=self.history)
-            ai_response = ""
-            async for chunk in generator:
-                yield chunk
-                ai_response += chunk
-            # 保留最近6轮对话中的浏览器状态，减少上下文
-            if len(self.history) > 6:
-                history_user_content = self.history[-2]["content"][0]["text"]
-                self.history[-6] = {"role": "user", "content": [
-                    {"type": "text", "text": remove_browser_info_in_the_history(history_user_content)}]}
-            self.history.extend([
-                {"role": "user", "content": [{"type": "text", "text": current_prompt}]},
-                {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
-            ])
-            # print(self.history)
-            parse_result = self.parse_tool_call(ai_response)
-            # AGENT_LOGGER.log_markdown(parsing_message, "Tool call parsing result")
-
-            if parse_result.tool_json:
-                AGENT_LOGGER.log_task(str(parse_result.tool_json), subtitle="CALLING······", title="Start tool call")
-
-                tool_call_result = None
-                async for status, chunk in self.call_tool(**parse_result.tool_json):
-                    if status == "[DONE]":
-                        yield "\n* * * * * * * * * * * *\n"
-                        tool_call_result = chunk
-                    else:
-                        yield chunk
-
-                assert tool_call_result is not None, "工具调用没有正确返回最终结果，请检查工具逻辑"
-
-                current_prompt = f"{tool_call_result}\n请你总结并反思工具执行的结果是否符合预期，如果有工具指令，请你遵循执行"
-            # 当解析工具调用JSON出错时，需要进行错误处理
+            content = msg["content"][0]["text"]
+            if isinstance(content, str) and not show_full_content and len(content) > 500:
+                preview = content[:250] + " ... (已折叠) ... " + content[-250:]
+                print(f"{preview}")
             else:
-                current_prompt = \
-                f"解析工具调用JSON时出现了问题，返回消息如下：\n{parse_result.parse_msg}\n"
-                "请你反思：\n"
-                "1.是否输出了正确的JSON格式文本；\n"
-                "2.是否选择了正确的工具并填入了正确的参数；\n"
-                "3.一个特别值得注意的点是，是否没有为字符串参数包裹引号\n"
-                "并在反思后尝试重新进行工具调用，对于同一任务最多重新尝试五次"
-
-            exist_tool_call = parse_result.exist_tool_call
-
-        AGENT_LOGGER.log_task(f"总计执行步数：{steps}", subtitle="DONE", title="Task Over")
+                print(content)
+        print()
 
     async def call_tool(
-            self,
-            function_name: str,
-            arguments: dict
-    ) -> AsyncGenerator[tuple, None]:
+        self,
+        tool_name: str,
+        arguments: dict
+    ) -> AsyncGenerator[Tuple[str, str], None]:
         """
         根据指定的工具名称调用工具
         """
@@ -171,55 +93,26 @@ class JarvisAgent:
             data: dict = Field(..., description="工具执行结果")
             instruction: str = Field(..., description="工具附带给模型的指令")
 
-        tool_function = self.tool_registrar.get_tool(function_name)
-        # 检查工具是否存在
+        tool_function = self.tool_registrar.get_tool(tool_name)
         if tool_function:
             try:
-                # 判断是否是异步生成器
-                if inspect.isasyncgenfunction(tool_function):
-                    # AGENT_LOGGER.log_markdown("Async tool call", "Tool call type")
-                    # 异步流式调用
-                    tool_result = {
-                        "data": {
-                            "final_result": ""
-                        },
-                        "instruction": ""
-                    }
-                    async for tool_chunk in tool_function(**arguments):
-                        ToolResultFormatValidator.model_validate(tool_chunk)
+                # AGENT_LOGGER.log_markdown("Async tool call", "Tool call type")
+                tool_result = ""
+                async for tool_chunk in tool_function(**arguments):
+                    ToolResultFormatValidator.model_validate(tool_chunk)
 
-                        chunk = tool_chunk["data"]["stream_chunk"]
-                        yield "[STREAMING]", chunk  # 返回流式数据
+                    # TODO: 此处暂时保留，后续可以删除工具中还包的一层stream_chunk字段
+                    chunk = tool_chunk["data"]["stream_chunk"]
+                    yield "[STREAMING]", chunk  # 返回流式数据
 
-                        tool_result["data"]["final_result"] += chunk
-                        tool_result["instruction"] = tool_chunk.get("instruction", "") # 将最后一个返回的工具指令作为最终工具指令
-                else:
-                    # AGENT_LOGGER.log_markdown("Sync tool call", "Tool call type")
-                    # 同步调用（适用于普通工具）
-                    tool_result = tool_function(**arguments)
-
-                    ToolResultFormatValidator.model_validate(tool_result)
+                    tool_result += chunk
             except Exception as e:
-                tool_result = {
-                    "data": {
-                        "error_message": f"工具执行发生错误，{e}\n工具名：{function_name}"
-                    },
-                    "instruction": "工具执行错误，请以中文总结并打印错误信息，并且打印具体工具名"
-                }
-        # 工具未找到的情况
+                tool_result = f"工具执行发生错误，{e}\n工具名：{tool_name}"
         else:
-            tool_result = {
-                "data": {
-                    "error_message": f"工具执行发生错误，没有找到工具{function_name}"
-                },
-                "instruction": "工具执行错误，请以中文总结并打印错误信息，并且打印具体工具名"
-            }
+            tool_result = f"工具执行发生错误，没有找到工具{tool_name}"
 
         # 返回最终结果
-        yield "[DONE]", str(
-            f"<tool_call_result>\n{tool_result.get('data')}\n</tool_call_result>\n"
-            f"<tool_instruction>\n{tool_result.get('instruction')}\n</tool_instruction>"
-        )
+        yield "[DONE]", f"<tool_response>\n{tool_result}\n</tool_response>"
 
     def parse_tool_call(
         self,
@@ -229,8 +122,6 @@ class JarvisAgent:
         解析LLM的输出文本，判断其中是否有工具调用格式，提取工具名称和参数。
         """
         # AGENT_LOGGER.log_task(llm_output_text, subtitle="ROUTING······", title="Parsing LLM output text")
-
-        # 尝试提取文本中的工具调用块
         match = re.search(r'<tool_call>\s*({.*?})\s*</tool_call>', ai_response, re.DOTALL)
         if not match:
             return ToolCallParseResult(False, None, "No tool call found in the llm output text.")
@@ -243,15 +134,316 @@ class JarvisAgent:
                 return ToolCallParseResult(True, None, f"Error decoding TOOL JSON: {e}")
 
             # 提取工具名以及填入参数
-            function_name = tool_call_json.get('name')
+            tool_name = tool_call_json.get('name')
             arguments = tool_call_json.get('arguments')
-            if function_name is None:
+            if tool_name is None:
                 return ToolCallParseResult(True, None, "Tool call JSON does not contain key: 'name'")
             if arguments is None:
                 return ToolCallParseResult(True, None, "Tool call JSON does not contain key: 'arguments'")
 
             return ToolCallParseResult(
                 True,
-                {"function_name": function_name, "arguments": arguments},
+                {"tool_name": tool_name, "arguments": arguments},
                 "Successfully extract tool call JSON"
             )
+
+    async def run(self, prompt: str, llm_name: str = None, step_limit: int = None) -> None:
+        if llm_name is not None:
+            self.llm = LLM(llm_name)
+
+        async for chunk in self._run(prompt, step_limit):
+            print(chunk, end="", flush=True)
+
+    @abstractmethod
+    async def _run(self, prompt: str, step_limit: int) -> AsyncGenerator[str, None]:
+        if False:
+            yield ""
+
+
+class JarvisAgent(BaseAgent):
+    """
+    jarvis后端agent代理
+    """
+    def __init__(self, init_model_name: str, sys_prompt_template: str, memory_dir: str):
+        super().__init__(init_model_name, sys_prompt_template)
+
+        self.memory_dir = Path(memory_dir)
+        self.tool_enhance_dict: Dict[str, Any] = self.load_memory(self.memory_dir / "tool_memory.json")
+        self.logger.log_task(str(self.tool_enhance_dict), subtitle="LOADING······", title="Load tool memory")
+        self.system_memory: str = self.load_memory(self.memory_dir / "system_memory.txt")
+        self.logger.log_task(self.system_memory, subtitle="LOADING······", title="Load system memory")
+
+        self.multi_steps_plan = None
+
+        self.tool_schema_texts = self.render_tool_schema_texts()
+        # system prompt永远在历史记录的最前面
+        # TODO: 思考为prompt template写类型检查的方法
+        self.history.append({"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
+            now=datetime.now(),
+            knowledge=self.system_memory,
+            tools=self.tool_schema_texts
+        )}]})
+
+    def render_tool_schema_texts(self) -> str:
+        tool_schemas = []
+        for tool_name, tool_func in self.tool_registrar.tools.items():
+            # 补充对tool memory的加载
+            if tool_name in self.tool_enhance_dict:
+                tool_schemas.append(
+                    generate_tool_schema(tool_func, self.tool_enhance_dict[tool_name]["tool_description"]))
+            else:
+                tool_schemas.append(generate_tool_schema(tool_func))
+
+        tools_schema_texts = "\n".join(tool_schemas)
+        self.logger.log_task(tools_schema_texts, subtitle="LOADING······", title="Loading Tools")
+        return tools_schema_texts
+
+    def load_memory(self, memory_path: str | Path):
+        path = Path(memory_path)
+        suffix = path.suffix.lower()
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+                if suffix == ".json":
+                    if not text.strip():
+                        print("empty json file")
+                        return {}
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError as e:
+                        print(e)
+                        traceback.print_exc()
+                        return {}
+                else:
+                    return text
+        except FileNotFoundError as e:
+            print(e)
+            traceback.print_exc()
+            if suffix == ".json":
+                return {}
+            else:
+                return ""
+
+    async def _run(
+        self,
+        prompt: str,
+        step_limit: int = 20
+    ) -> AsyncGenerator[str, None]:
+
+        # 所有yield的结果都仅用于给用户展示结果
+        # 实际上下文分析始终以agent.history属性中保存的为准
+        plan_trajectory = []
+        async for chunk in self.multi_step_task_plan(prompt, plan_trajectory):
+            yield chunk
+
+        for step_index, (task_step, step_goal) in enumerate(self.multi_steps_plan.items()):
+            current_step = f"Step{step_index + 1}: {task_step}\nGoal: {step_goal}"
+            self.logger.log_task(current_step, subtitle=f"EXECUTING", title=f"Executing Task Step {step_index + 1}")
+
+            task_step_retry_time_limit = 2
+            finish = False
+            try_times = 0
+            sub_goal_trajectory = []
+            while not finish and try_times < task_step_retry_time_limit:
+                async for chunk in self.reason_and_act(current_step, step_limit, sub_goal_trajectory):
+                    yield chunk
+
+                reflect_response = ""
+                async for chunk in self.react_block_reflect(plan_trajectory + sub_goal_trajectory):
+                    yield chunk
+                    reflect_response += chunk
+                reflection: Dict[str, str] = extract_json_codeblock(reflect_response)
+                finish = True if reflection["finish"].lower() == "yes" else False
+
+            # DEBUG
+            break
+            if step_index == 1:
+                break
+
+    async def react_block_reflect(self, trajectory: List[dict]):
+        # print("\n\n", prompt)
+        async for chunk in self.llm.async_stream_generate(react_block_reflect_prompt, history=trajectory):
+            yield chunk
+        self.pretty_print_trajectory(trajectory)
+
+    async def single_turn_chat(
+        self,
+        prompt: str,
+        llm_name: str = None
+    ) -> str:
+        if llm_name is not None:
+            self.llm = LLM(llm_name)
+
+        ai_response = ""
+        async for chunk in self.llm.async_stream_generate(prompt, history=self.history):
+            ai_response += chunk
+            print(chunk, end="", flush=True)
+        self.history.extend([
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
+        ])
+
+        return ai_response
+
+
+    async def multi_step_task_plan(self,
+            prompt: str,
+            trajectory: List[dict]
+    ):
+        current_prompt = f"<task>\n{prompt}\n</task>\n\n{jarvis_list_fact_prompt}"
+
+        known_facts = ""
+        async for chunk in self.llm.async_stream_generate(current_prompt, history=self.history):
+            yield chunk
+            known_facts += chunk
+        self.history.extend([
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            {"role": "assistant", "content": [{"type": "text", "text": known_facts}]}
+        ])
+        yield "\n\n"
+
+        unknown_facts = ""
+        async for chunk in self.llm.async_stream_generate(jarvis_confirm_fact_prompt, history=self.history):
+            yield chunk
+            unknown_facts += chunk
+        self.history[-1] = {"role": "assistant", "content": [{"type": "text", "text": f"{known_facts}\n\n{unknown_facts}"}]}
+        yield "\n\n"
+
+        multi_steps_plan = ""
+        async for chunk in self.llm.async_stream_generate(jarvis_plan_multi_steps_task_prompt, history=self.history):
+            yield chunk
+            multi_steps_plan += chunk
+
+        self.multi_steps_plan = extract_json_codeblock(multi_steps_plan)
+        self.history[-1] = {"role": "assistant",
+                            "content": [{"type": "text", "text": f"{known_facts}\n\n{unknown_facts}\n\n* 任务方案可分为如下步骤：\n    {
+                                '\n    '.join([f'{i+1}. {x}' for i, x in enumerate(self.multi_steps_plan.keys())])
+                            }"}]}
+        self.logger.log_task(self.history[-1]["content"][0]["text"], "PLANNING···", "Generate task plan")
+
+        trajectory.extend(self.history[:])
+
+    async def reason_and_act(
+            self,
+            prompt: str,
+            step_limit: int = None,
+            trajectory: list = None,
+    ) -> AsyncGenerator[str, None]:
+        """
+        判断LLM输出中是否包含工具执行要求，如果存在则会执行工具
+        这一过程会反复进行，直到LLM输出中不再包含工具执行要求
+        """
+        current_prompt = jarvis_execute_task_step_prompt.format(task_step=prompt)
+        exist_tool_call = True
+        steps = 0
+        # working_memory = []
+        while exist_tool_call and (step_limit is None or steps < step_limit):
+            # 需要修改system_prompt中的当前时间
+            self.history[0] = {"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
+                now=datetime.now(),
+                knowledge=self.system_memory,
+                tools=self.tool_schema_texts
+            )}]}
+
+            user_message = {"role": "user", "content": [{"type": "text", "text": current_prompt}]}
+            if steps == 0:
+                generator = self.llm.async_stream_generate(current_prompt, history=self.history)
+                trajectory.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+            else:
+                generator = self.llm.async_stream_generate(jarvis_act_prompt.format(observation=current_prompt), history=self.history)
+                trajectory.append(user_message)
+
+            ai_response = ""
+            async for chunk in generator:
+                yield chunk
+                ai_response += chunk
+
+            # 保留最近6轮对话中的浏览器状态，减少上下文
+            if len(self.history) > 6:
+                history_user_content = self.history[-6]["content"][0]["text"]
+                assert self.history[-6].get("role") == "user"
+                self.history[-6] = {"role": "user", "content": [{"type": "text", "text": remove_browser_info_in_the_history(history_user_content)}]}
+            ai_message = {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
+            self.history.extend([user_message, ai_message])
+            trajectory.append(ai_message)
+
+            # print(self.history)
+            parse_result = self.parse_tool_call(ai_response)
+            # AGENT_LOGGER.log_markdown(parsing_message, "Tool call parsing result")
+
+            if parse_result.tool_json:
+                self.logger.log_task(str(parse_result.tool_json), subtitle="CALLING······", title=f"Action Step {steps + 1} ")
+
+                tool_call_result = None
+                async for status, chunk in self.call_tool(**parse_result.tool_json):
+                    if status == "[DONE]":
+                        yield "\n* * * * * * * * * * * *\n"
+                        tool_call_result = chunk
+                    else:
+                        yield chunk
+
+                assert tool_call_result is not None, "工具调用没有正确返回最终结果，请检查工具逻辑"
+
+                current_prompt = f"Observation: \n{tool_call_result}\n"
+                # AGENT_LOGGER.log_task(current_prompt, subtitle="PROMPT", title="New prompt")
+            # 当没有解析到tool_json时，仅存在没有工具以及工具解析出错两种情况
+            else:
+                # 如果没有工具，那么以下prompt将不会进入下一次循环，将废弃
+                # 反之将进入下一次循环，让Agent反思
+                current_prompt = f"Observation: \n{parse_result.parse_msg}\n解析工具调用JSON时出现了问题，请考虑以下情况：1. 是否输出了正确的JSON格式文本；2. 是否选择了正确的工具并填入了正确的参数；3. 一个特别值得注意的点是，是否没有为字符串参数包裹引号"
+
+                # AGENT_LOGGER.log_task(current_prompt, subtitle="PROMPT", title="New prompt")
+            exist_tool_call = parse_result.exist_tool_call
+
+        self.logger.log_task(f"总计执行步数：{steps + 1}", subtitle="DONE", title="Task Over")
+        return
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict
+    ) -> AsyncGenerator[tuple, None]:
+        """
+        根据指定的工具名称调用工具
+        """
+
+        # 定义工具返回结果的格式
+        class ToolResultFormatValidator(BaseModel):
+            data: dict = Field(..., description="工具执行结果")
+            instruction: str = Field(..., description="工具附带给模型的指令")
+
+        tool_function = self.tool_registrar.get_tool(tool_name)
+        if tool_function:
+            try:
+                # 新增加一个工具指令
+                tool_result = {
+                    "data": "",
+                    "instruction": ""
+                }
+                async for tool_chunk in tool_function(**arguments):
+                    ToolResultFormatValidator.model_validate(tool_chunk)
+
+                    chunk = tool_chunk["data"]["stream_chunk"]
+                    yield "[STREAMING]", chunk  # 返回流式数据
+
+                    tool_result["data"] += chunk
+                    tool_result["instruction"] = tool_chunk.get("instruction", "")  # 将最后一个返回的工具指令作为最终工具指令
+                # 优先使用工具记忆中的工具指令
+                if tool_name in self.tool_enhance_dict:
+                    tool_result["instruction"] = self.tool_enhance_dict[tool_name]["tool_instruction"]
+            except Exception as e:
+                tool_result = {
+                    "data": f"工具执行发生错误，{e}\n工具名：{tool_name}",
+                    "instruction": "工具执行错误，请打印错误信息，并且打印具体工具名"
+                }
+        else:
+            tool_result = {
+                "data": f"工具执行发生错误，没有找到工具{tool_name}",
+                "instruction": "工具执行错误，请打印错误信息，并且打印具体工具名"
+            }
+
+        yield "[DONE]", str(
+            f"<tool_response>\n{tool_result.get('data')}\n</tool_response>\n"
+            f"<tool_instruction>\n{tool_result.get('instruction')}\n</tool_instruction>"
+        )

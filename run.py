@@ -2,72 +2,120 @@ import asyncio
 import argparse
 import json
 import os
+import re
 import subprocess
-from typing import List
+import traceback
+from typing import List, Any, Optional, Dict
 
-from agent import JarvisAgent, AGENT_LOGGER
-from toolbox.browse import browser
-from prompt import jarvis_sys_prompt
+from agent import JarvisAgent, extract_json_codeblock
+from prompt.system_prompt import jarvis_sys_prompt
 
-async def main():
-    parser = argparse.ArgumentParser(description="与 Jarvis 交互")
-    parser.add_argument("task", type=str, help="请输入你的指令（英文或中文）")
-    args = parser.parse_args()
-
-    jarvis = JarvisAgent(init_model_name="gemini", sys_prompt_template=jarvis_sys_prompt)
-
-    AGENT_LOGGER.log_task(args.task, subtitle="STARTING······", title="Task")
-
-    await jarvis.chat(args.task, "memory/system_memory.txt", step_limit=50)
-
-#     await jarvis.chat(
-#     prompt = """\
-# 我们需要订购一台新服务器。Emma Lewis 应该已经收集了几家公司的报价并存放在 OwnCloud 上。请按以下步骤操作：
-#
-# 1. 联系 Emma Lewis（通过 RocketChat）询问报价文件存放位置
-# 2. 将报价文件下载到工作区目录（workspace）
-# 3. 与 Sarah 讨论服务器需求规格
-# 4. 创建 CSV 文件"valid-quotes.csv"，仅包含符合需求的供应商信息：
-#    - 必须包含"name"（公司名称）和"price"（报价）两列
-# 5. 将文件上传至 OwnCloud 的 Documents/Administrative Specialist 目录
-# 6. 为该文件创建公开分享链接（任何人可访问）
-# 7. 仅将该链接的 URL 写入 `/workspace/link.txt` 文件
-# """
-#     , step_limit=20)
-
-    jarvis.save_trajectory("trajectory.json")
-
-    await jarvis.chat( "请分点陈述，总结对于这个任务，你已经做了些什么", step_limit=1)
-
+def get_TAC_evaluation(task_name: str) -> str:
     cmd = [
         "python_default", "/utils/eval.py",
-        "--trajectory_path", "/jarvis/trajectory.json",
-        "--result_path", "/jarvis/agent_eval_output.json"
+        "--trajectory_path", f"/jarvis/outputs/ours/{task_name}/trajectory.json",
+        "--result_path", f"/jarvis/outputs/ours/{task_name}/agent_eval_output.json"
     ]
     env = {"DECRYPTION_KEY": "theagentcompany is all you need", **os.environ}
     proc = subprocess.run(cmd, capture_output=True, env=env, text=True)
     eval_result = proc.stdout + "\n" + proc.stderr
 
-    print("="*10, "BEGIN Eval Result BEGIN", "="*10)
+    print("=" * 10, "BEGIN Eval Result BEGIN", "=" * 10)
     print(eval_result)
-    print("="*10, "END Eval Result END", "="*10)
+    print("=" * 10, "END Eval Result END", "=" * 10)
 
-    await jarvis.chat(f"<eval_result>\n{eval_result}\n</eval_result>" + "\n以上内容为对任务执行情况逐步骤的评估\n\n"
-                                    "对比你已经进行完的步骤，请你总结经验，包括：\n"
-                                    "1. 对成功的步骤总结经验\n"
-                                    "2. 对失败的步骤进行反思\n"
-                                    "这些经验可以是针对特定工具的使用经验，或者总结行为原则和方法论", step_limit=1)
+    return eval_result
 
-    with open("memory/system_memory.txt", mode="r", encoding="utf-8") as f:
-        past_memo = f.read()
+async def main():
+    parser = argparse.ArgumentParser(description="与Agent交互")
+    parser.add_argument("task", type=str, help="请输入你的指令（英文或中文）")
+    parser.add_argument("task_name", type=str, help="任务名")
+    args = parser.parse_args()
 
-    new_memo = await jarvis.chat(f"<past_memo>\n{past_memo}\n</past_memo>" + "\n以上是你过去执行任务时积攒的经验\n\n请你将你的最新经验与之进行求同存异的合并，用于给你下次执行相关任务时提供参考。", step_limit=1)
+    jarvis = JarvisAgent(
+        init_model_name="gemini",
+        sys_prompt_template=jarvis_sys_prompt,
+        memory_dir="memory"
+    )
+
+    jarvis.logger.log_task(args.task, subtitle="STARTING······", title="Task")
+
+    await jarvis.run(args.task, step_limit=50)
+
+    jarvis.save_trajectory(f"outputs/ours/{args.task_name}/trajectory.json")
+
+    # Only could run in the TAC docker env
+    eval_result = get_TAC_evaluation(args.task_name)
+
+    await jarvis.single_turn_chat("请分点陈述，总结对于这个任务，你已经做了些什么")
+
+    conclude_prompt = f"""\
+<eval_result>\n{eval_result}\n</eval_result>
+以上内容为对任务执行情况逐步骤的评估
+
+对比你已经进行完的步骤，请你总结经验，包括：
+1. 对成功的步骤总结经验
+2. 对失败的步骤进行反思
+这些经验可以是针对特定工具的使用经验，或者总结行为原则和方法论
+"""
+
+    await jarvis.single_turn_chat(conclude_prompt)
+
+
+    tool_enhance_prompt = f"""\
+请你根据本次任务的实际使用情况，对所用工具进行总结和反馈，并对每个工具的功能描述和工具指令进行优化或补充。
+请参考最开始给你的那些工具描述，在其基础上对需要的工具进行优化修改。
+你的目标是让这些描述和指令更加准确，并且有助于你下次更高效、更精准地调用工具。
+<tips>
+工具描述：对工具整体功能、作用、注意事项或任意你觉得需要的描述
+工具指令：工具执行完之后附带的一个指令，用于控制工具执行完之后的行为
+</tips>
+
+对于你的修改，请你最终以如下格式输出：
+```json
+{{
+    "<tool_name>": {{
+        "tool_description": "<the tool description you wanna change to ",
+        "tool_instruction": "<the tool instruction you wanna change to >"
+    }}
+    ··· # 你可以修改任意个工具
+}}
+```
+"""
+    tool_enhance_dict = jarvis.tool_enhance_dict.copy()
+    tool_enhance_result = await jarvis.single_turn_chat(tool_enhance_prompt)
+    tool_enhance_dict.update(
+        extract_json_codeblock(tool_enhance_result)
+    )
+    with open("memory/back/tool_memory.json", "w") as f:
+        f.write(json.dumps(tool_enhance_dict, ensure_ascii=False, indent=2))
+
+    specific_task_enhance_prompt = f"""\
+请你对本次任务中碰到的障碍和解决方法进行反思和总结。
+你的目标是在下次进行相关任务并碰到类似障碍时，能够很快应用正确的解决方案。
+<tips>
+你的总结应该足够细致和详细，为下次面临同样的情形时提供足够的参考
+不要进行空泛的总结，要具体到方法
+你也可以总结你在某些平台和应用上碰到的特有的障碍，以及你的解决方法
+</tips>
+
+对于你的总结，请你最终以如下格式输出：
+```json
+{{
+    "<problem>": "<solution>"
+    ···
+}}
+```
+"""
+    await jarvis.single_turn_chat(specific_task_enhance_prompt)
+
+    new_memo = await jarvis.single_turn_chat("请你将你最新的全部反思、总结与你先前的经验进行求同存异的合并，用于给你下次执行相关任务时提供参考")
 
     # print("=" * 10, "BEGIN new memory BEGIN", "=" * 10)
     # print(new_memo)
     # print("=" * 10, "END new memory END", "=" * 10)
 
-    with open("memory/system_memory.txt", mode="w", encoding="utf-8") as f:
+    with open("memory/back/system_memory.txt", mode="w", encoding="utf-8") as f:
         f.write(new_memo)
 
 

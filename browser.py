@@ -41,7 +41,7 @@ class BrowserUseLight:
             'is_mobile': False,
             'device_scale_factor': 1.0,
             'disable_security': False,
-            # 'headless': True,
+            'headless': True,
             "id": "79bfe7fd-1a9b-4c69-a7aa-0266ff82e49b",
             "default": True,
             "created_at": "2025-07-16T10:12:15.367877",

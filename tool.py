@@ -3,7 +3,8 @@ import inspect
 import json
 import os
 import re
-from typing import Callable, List, Union, get_origin, get_args
+from typing import Callable, List, Union, get_origin, get_args, Dict, Any
+
 
 class ToolRegistry:
     def __init__(self):
@@ -48,7 +49,7 @@ class ToolRegistry:
             self.load_module_tools(module_name)
 
 
-def generate_tool_json(func: Callable):
+def generate_tool_schema(func: Callable, enhance_des: str | None = None) -> str:
     """将工具函数转化为json描述"""
 
     # 用于将python函数类型映射为json schema类型
@@ -135,16 +136,23 @@ def generate_tool_json(func: Callable):
         if param.default == inspect._empty:
             parameters["required"].append(param_name)
 
-    tool_json = json.dumps({
+    if enhance_des is not None:
+        func_des = enhance_des
+    elif doc:
+        func_des = doc.split("\nArgs:")[0]
+    else:
+        func_des = "暂无函数描述"
+
+    tool_schema = {
         "type": "function",
         "function": {
             "name": func_name,
-            "description": doc.split("\nArgs:")[0] if doc else "暂无函数描述",
+            "description": func_des,
             "parameters": parameters
         }
-    }, ensure_ascii=False)
+    }
 
-    return tool_json
+    return json.dumps(tool_schema, ensure_ascii=False)
 
 
 # if __name__ == '__main__':
