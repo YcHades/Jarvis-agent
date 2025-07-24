@@ -5,12 +5,12 @@ import os
 import re
 import subprocess
 import traceback
-from typing import List, Any, Optional, Dict
+from typing import List, Any, Optional, Dict, Tuple
 
 from agent import JarvisAgent, extract_json_codeblock
 from prompt.system_prompt import jarvis_sys_prompt
 
-def get_TAC_evaluation(task_name: str) -> str:
+def get_TAC_evaluation(task_name: str) -> Tuple[str, str]:
     cmd = [
         "python_default", "/utils/eval.py",
         "--trajectory_path", f"/jarvis/outputs/ours/{task_name}/trajectory.json",
@@ -24,12 +24,19 @@ def get_TAC_evaluation(task_name: str) -> str:
     print(eval_result)
     print("=" * 10, "END Eval Result END", "=" * 10)
 
-    return eval_result
+    with open("/instruction/checkpoints.md", "r") as f:
+        checkpoints = f.read()
+
+    print("=" * 10, "BEGIN Checkpoints BEGIN", "=" * 10)
+    print(checkpoints)
+    print("=" * 10, "END Checkpoints END", "=" * 10)
+
+    return eval_result, checkpoints
 
 async def main():
     parser = argparse.ArgumentParser(description="与Agent交互")
-    parser.add_argument("task", type=str, help="请输入你的指令（英文或中文）")
     parser.add_argument("task_name", type=str, help="任务名")
+    parser.add_argument("task", type=str, help="请输入你的指令（英文或中文）")
     args = parser.parse_args()
 
     jarvis = JarvisAgent(
@@ -45,26 +52,29 @@ async def main():
     jarvis.save_trajectory(f"outputs/ours/{args.task_name}/trajectory.json")
 
     # Only could run in the TAC docker env
-    eval_result = get_TAC_evaluation(args.task_name)
+    eval_result, checkpoints = get_TAC_evaluation(args.task_name)
+
+    print("\n\n")
 
     await jarvis.single_turn_chat("请分点陈述，总结对于这个任务，你已经做了些什么")
 
     conclude_prompt = f"""\
+<checkpoints>\n{checkpoints}\n</checkpoints>
 <eval_result>\n{eval_result}\n</eval_result>
-以上内容为对任务执行情况逐步骤的评估
+以上内容为该任务的得分点和最终的得分评估
 
 对比你已经进行完的步骤，请你总结经验，包括：
 1. 对成功的步骤总结经验
 2. 对失败的步骤进行反思
-这些经验可以是针对特定工具的使用经验，或者总结行为原则和方法论
 """
-
     await jarvis.single_turn_chat(conclude_prompt)
 
+    print("\n\n")
 
     tool_enhance_prompt = f"""\
 请你根据本次任务的实际使用情况，对所用工具进行总结和反馈，并对每个工具的功能描述和工具指令进行优化或补充。
 请参考最开始给你的那些工具描述，在其基础上对需要的工具进行优化修改。
+browser_get_browser_state，browser_extract_content两个工具为核心工具，对其描述需要谨慎修改。
 你的目标是让这些描述和指令更加准确，并且有助于你下次更高效、更精准地调用工具。
 <tips>
 工具描述：对工具整体功能、作用、注意事项或任意你觉得需要的描述
@@ -87,36 +97,60 @@ async def main():
     tool_enhance_dict.update(
         extract_json_codeblock(tool_enhance_result)
     )
-    with open("memory/back/tool_memory.json", "w") as f:
+    with open("memory/tool_memory.json", "w") as f:
         f.write(json.dumps(tool_enhance_dict, ensure_ascii=False, indent=2))
 
-    specific_task_enhance_prompt = f"""\
-请你对本次任务中碰到的障碍和解决方法进行反思和总结。
+    print("\n\n")
+
+    application_enhance_prompt = f"""\
+请你对本次任务中碰到的特定平台和应用中的障碍及其解决方法进行反思和总结，形成'特定平台和应用中的注意事项、障碍及其解决方法'。
 你的目标是在下次进行相关任务并碰到类似障碍时，能够很快应用正确的解决方案。
 <tips>
 你的总结应该足够细致和详细，为下次面临同样的情形时提供足够的参考
-不要进行空泛的总结，要具体到方法
-你也可以总结你在某些平台和应用上碰到的特有的障碍，以及你的解决方法
+不要进行空泛的总结，要具体到问题和方法
 </tips>
 
 对于你的总结，请你最终以如下格式输出：
 ```json
 {{
-    "<problem>": "<solution>"
+    "<application_name>": {{
+        "<problem>": "<solution>"
+    }}
     ···
 }}
 ```
 """
-    await jarvis.single_turn_chat(specific_task_enhance_prompt)
+    await jarvis.single_turn_chat(application_enhance_prompt)
 
-    new_memo = await jarvis.single_turn_chat("请你将你最新的全部反思、总结与你先前的经验进行求同存异的合并，用于给你下次执行相关任务时提供参考")
+    application_memo = await jarvis.single_turn_chat("请你将你最新的'特定平台和应用中的注意事项、障碍及其解决方法'与你先前的行求同存异的合并，用于给你下次执行相关任务时提供参考")
 
-    # print("=" * 10, "BEGIN new memory BEGIN", "=" * 10)
-    # print(new_memo)
-    # print("=" * 10, "END new memory END", "=" * 10)
+    with open("memory/application_memory.txt", mode="w", encoding="utf-8") as f:
+        f.write(application_memo)
 
-    with open("memory/back/system_memory.txt", mode="w", encoding="utf-8") as f:
-        f.write(new_memo)
+    print("\n\n")
+
+    methodology_enhance_prompt = f"""\
+请你对本次任务中碰到的其他困境进行总结，关注你做对了什么和做错了什么，形成后续任务的'原则和方法论'。
+你的目标是在下次以更正确的行为方式解决任务。
+<tips>
+你的总结应该足够细致和详细，为下次面临同样的情形时提供足够的参考
+不要进行空泛的总结，要具体到问题和方法
+</tips>
+
+对于你的总结，请你最终以如下格式输出：
+```json
+{{
+    "<dilemma>": "<methodology>"
+    ···
+}}
+```
+"""
+    await jarvis.single_turn_chat(methodology_enhance_prompt)
+
+    methodology_memo = await jarvis.single_turn_chat("请你将你最新的'原则和方法论'与你先前的进行求同存异的合并，用于给你下次执行相关任务时提供参考")
+
+    with open("memory/methodology_memory.txt", mode="w", encoding="utf-8") as f:
+        f.write(methodology_memo)
 
 
 # def pre_login(browser: BrowserUseLight, sites: List[str]):

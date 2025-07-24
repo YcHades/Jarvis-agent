@@ -1,3 +1,4 @@
+import asyncio
 import re
 import json
 import inspect
@@ -11,7 +12,8 @@ from pydantic import BaseModel, Field
 from typing import AsyncGenerator, Union, Dict, Any, Tuple, List
 
 from model import LLM
-from prompt.reflect_memory import react_block_reflect_prompt
+from prompt.reflect_memory import react_block_reflect_check_completion_prompt, react_block_conclude_success_prompt, \
+    react_block_analyse_dilemma_prompt
 from prompt.system_prompt import jarvis_list_fact_prompt, jarvis_confirm_fact_prompt, \
     jarvis_plan_multi_steps_task_prompt, jarvis_execute_task_step_prompt, jarvis_act_prompt
 from tool import generate_tool_schema, ToolRegistry
@@ -37,6 +39,7 @@ class BaseAgent:
         self.tool_registrar.load_tools(tools_folder="toolbox")
 
         self.history = []
+        self.total_steps = 0
         self.sys_prompt_template = sys_prompt_template
 
     def render_tool_schema_texts(self) -> str:
@@ -74,11 +77,31 @@ class BaseAgent:
 
             content = msg["content"][0]["text"]
             if isinstance(content, str) and not show_full_content and len(content) > 500:
-                preview = content[:250] + " ... (已折叠) ... " + content[-250:]
+                preview = content[:250] + "\n ... (已折叠) ... \n" + content[-250:]
                 print(f"{preview}")
             else:
                 print(content)
         print()
+
+    async def single_turn_chat(
+        self,
+        prompt: str,
+        llm_name: str = None
+    ) -> str:
+        # 用于发起不进行tool call的单轮对话，但是仍然会使用agent先前的历史记录
+        if llm_name is not None:
+            self.llm = LLM(llm_name)
+
+        ai_response = ""
+        async for chunk in self.llm.async_stream_generate(prompt, history=self.history):
+            ai_response += chunk
+            print(chunk, end="", flush=True)
+        self.history.extend([
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
+        ])
+
+        return ai_response
 
     async def call_tool(
         self,
@@ -170,7 +193,15 @@ class JarvisAgent(BaseAgent):
         self.memory_dir = Path(memory_dir)
         self.tool_enhance_dict: Dict[str, Any] = self.load_memory(self.memory_dir / "tool_memory.json")
         self.logger.log_task(str(self.tool_enhance_dict), subtitle="LOADING······", title="Load tool memory")
-        self.system_memory: str = self.load_memory(self.memory_dir / "system_memory.txt")
+        self.application_memory: str = self.load_memory(self.memory_dir / "application_memory.txt")
+        # self.logger.log_task(self.application_memory, subtitle="LOADING······", title="Load application memory")
+        self.methodology_memory: str = self.load_memory(self.memory_dir / "methodology_memory.txt")
+        # self.logger.log_task(self.methodology_memory, subtitle="LOADING······", title="Load methodology memory")
+
+        self.temp_memory: str = ""
+
+        self.system_memory = (f"<原则和方法论>{self.methodology_memory}</原则和方法论>\n"
+                              f"<特定平台和应用中的注意事项、障碍及其解决方法>{self.application_memory}</特定平台和应用中的注意事项、障碍及其解决方法>\n")
         self.logger.log_task(self.system_memory, subtitle="LOADING······", title="Load system memory")
 
         self.multi_steps_plan = None
@@ -249,43 +280,65 @@ class JarvisAgent(BaseAgent):
                 async for chunk in self.reason_and_act(current_step, step_limit, sub_goal_trajectory):
                     yield chunk
 
-                reflect_response = ""
-                async for chunk in self.react_block_reflect(plan_trajectory + sub_goal_trajectory):
+                reflection: Dict[str, str] = {"finish": "no",}
+                # 注意：the trajectory used for reflect will remove the ReAct block starter instruction
+                async for chunk in self.react_block_reflect(plan_trajectory + sub_goal_trajectory, reflection):
                     yield chunk
-                    reflect_response += chunk
-                reflection: Dict[str, str] = extract_json_codeblock(reflect_response)
-                finish = True if reflection["finish"].lower() == "yes" else False
+                if reflection["finish"].lower() == "yes":
+                    finish = True
+                else:
+                    current_step += "\n该任务步骤的目标还没有达成，请继续执行"
+                    yield current_step
+                    finish = False
+                try_times += 1
 
             # DEBUG
-            break
-            if step_index == 1:
-                break
+            # break
+            # if step_index == 1:
+            #     break
 
-    async def react_block_reflect(self, trajectory: List[dict]):
+            if not finish:
+                self.logger.log_task(f"Done at step {step_index + 1}, agent don't finish this step at {task_step_retry_time_limit} times.", subtitle=f"DONE", title=f"Task Failed")
+                return
+
+        self.logger.log_task(f"Agent finish all the task steps， total tool call steps: {self.total_steps}.", subtitle=f"DONE", title=f"Task Finished")
+        return
+
+    async def react_block_reflect(self, trajectory: List[dict], reflection: Dict[str, str]):
         # print("\n\n", prompt)
-        async for chunk in self.llm.async_stream_generate(react_block_reflect_prompt, history=trajectory):
-            yield chunk
-        self.pretty_print_trajectory(trajectory)
+        tasks = [
+            self.llm.async_generate(react_block_reflect_check_completion_prompt, history=trajectory),
+            self.llm.async_generate(react_block_conclude_success_prompt.format(past_conclusion=self.temp_memory), history=trajectory),
+        ]
+        finish, conclude = await asyncio.gather(*tasks)
+        finish, conclude = extract_json_codeblock(finish), extract_json_codeblock(conclude)
+        reflection["finish"] = finish.get("finish", "no")
 
-    async def single_turn_chat(
-        self,
-        prompt: str,
-        llm_name: str = None
-    ) -> str:
-        if llm_name is not None:
-            self.llm = LLM(llm_name)
+        lines = [f"- {k}: {v}" for k, v in conclude.items()]
+        conclude = "\n".join(lines) + "\n"
+        yield conclude
 
-        ai_response = ""
-        async for chunk in self.llm.async_stream_generate(prompt, history=self.history):
-            ai_response += chunk
-            print(chunk, end="", flush=True)
-        self.history.extend([
-            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-            {"role": "assistant", "content": [{"type": "text", "text": ai_response}]}
-        ])
+        # 更新系统记忆
+        self.temp_memory = "<当前任务执行中积攒的经验>" + conclude + "</当前任务执行中积攒的经验>"
+        self.logger.log_task(self.temp_memory, subtitle="LOADING······", title="Load temp memory")
+        self.history[0] = {"role": "system", "content": [{"type": "text", "text": self.sys_prompt_template.format(
+            now=datetime.now(),
+            knowledge=self.system_memory + "\n" + self.temp_memory,
+            tools=self.tool_schema_texts
+        )}]}
 
-        return ai_response
+        if reflection["finish"] == "no":
+            analysis = ""
+            async for chunk in self.llm.async_stream_generate(react_block_analyse_dilemma_prompt, history=trajectory):
+                yield chunk
+                analysis += chunk
+            messages = [
+                {"role": "user", "content": [{"type": "text", "text": react_block_analyse_dilemma_prompt}]},
+                {"role": "assistant", "content": [{"type": "text", "text": analysis}]}
+            ]
+            self.history.extend(messages)
 
+        # self.pretty_print_trajectory(trajectory)
 
     async def multi_step_task_plan(self,
             prompt: str,
@@ -395,8 +448,10 @@ class JarvisAgent(BaseAgent):
 
                 # AGENT_LOGGER.log_task(current_prompt, subtitle="PROMPT", title="New prompt")
             exist_tool_call = parse_result.exist_tool_call
+            steps += 1
 
-        self.logger.log_task(f"总计执行步数：{steps + 1}", subtitle="DONE", title="Task Over")
+        self.total_steps += steps
+        self.logger.log_task(f"当前任务步骤执行步数：{steps}", subtitle="DONE", title="Task Step Over")
         return
 
     async def call_tool(

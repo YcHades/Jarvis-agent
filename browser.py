@@ -66,7 +66,7 @@ class BrowserUseLight:
         llm_config = get_default_llm(self.config)
         if api_key := llm_config.get('api_key'):
             self.llm = ChatOpenAI(
-                model=llm_config.get('model', 'gpt-4o-mini'),
+                model=llm_config.get('model', 'gemini-2.5-flash	'),
                 api_key=api_key,
                 base_url=os.getenv('BASE_URL'),
                 temperature=llm_config.get('temperature', 0.7),

@@ -80,6 +80,7 @@ password: theagentcompany
 1. 列出关于任务的，你已经知道的事实以及你还需要知道的事实
 2. 规划出一个可行的分步骤任务方案
 3. 按照任务步骤执行任务，注意仅当得到一个步骤的结果时才继续执行下一个步骤
+4. 总结所有任务步骤的结果，给出整个任务的最终结果
 
 总体流程模板如下：
 <template>
@@ -106,6 +107,7 @@ xxx
 **At the end of finishing a task step, you need to output "Final Answer: xxx" and wait the user instruction.
 Don't be hurry to start next step**
 </workflow>
+Result: xxx
 
 Step2: xxx
 Goal: xxx
@@ -114,11 +116,12 @@ xxx
 **At the end of finishing a task step, you need to output "Final Answer: xxx" and wait the user instruction.
 Don't be hurry to start next step**
 </workflow>
+Result: xxx
 
 ······
 
 * 所有任务方案中的步骤都已经完成，最终结果为：
-xxx
+Overall result: xxx
 </template>
 
 注意：

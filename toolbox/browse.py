@@ -57,9 +57,12 @@ async def browser_get_browser_state():
     1. 当前浏览器显示的标签页的url
     2. 当前浏览器显示的标签页的title
     3. 当前浏览器打开的所有标签页信息（包括各标签页的url和title）
-    4. 当前浏览器显示的标签页的可见元素信息（包括元素index、tag、text，以及可能有的href）
+    4. 当前浏览器显示的标签页的可交互元素信息（包括元素index、tag、text等，这些信息都来自标签页的DOM树）
 
-    注意：该浏览器状态获得后最多会在上下文中维持六轮对话，然后需要重新获取
+    注意：
+    - 该工具使用后将会给浏览器当前标签页上的可交互元素绘制标记框以及元素索引，重复使用将会更新绘制，在页面变化后需要及时利用这个工具更新
+    - 该工具对于文本、视觉内容信息的提取可能比较简略，富内容信息需要使用browser_extract_content_by_vision工具补充提取
+    - 该浏览器状态获得后最多会在上下文中维持六轮对话，然后需要重新获取
     """
     result = await browser._get_browser_state()
 
@@ -70,18 +73,30 @@ async def browser_get_browser_state():
         "instruction": ""
     }
 
-async def browser_extract_content_by_vision(query: str = "请详细地描述这个网页"):
+async def browser_extract_content(query: str = "请详细地描述这个网页", need_mark: bool = False):
     """
-    根据指令，使用视觉模型提取当前浏览器的标签页中的相关内容
+    根据指令，使用视觉模型从浏览器页面截图以及HTML源码中提取当前浏览器的标签页中的相关内容
+
+    注意：
+    - browser_get_browser_state将为浏览器当前标签页上的可交互元素绘制的标记框以及元素索引，这些标记也可以被视觉模型识别到，重新进入该页面将移除这些标记
+    - 视觉识别模型不是绝对正确的，包括对页面内容的提取以及元素索引的数字也存在出错可能
+    - 作为建议，在对当前网页内容没有把握时，可以先使用全面描述的query，再使用更细致的query，以免陷入某种偏见
 
     Args：
         query: 给视觉模型的内容提取的指令，默认为：请详细地描述这个网页
+        need_mark: 自动使用browser_get_browser_state为页面的可交互元素绘制标记，默认为False（但是当前页面如果在先前的action中调用过browser_get_browser_state，那么即使该参数设置为False仍然会有标记）
     """
-    result = await browser._extract_content_by_vision(query)
+    if need_mark:
+        await browser._get_browser_state()
+    tasks = [browser._extract_content_by_vision(query), browser._extract_content(query, True)]
+    vision_result, html_result = await asyncio.gather(*tasks)
 
     yield {
         "data": {
-            "stream_chunk": result
+            "stream_chunk": str({
+                "vision_result": vision_result,
+                "html_result": html_result
+            })
         },
         "instruction": ""
     }
